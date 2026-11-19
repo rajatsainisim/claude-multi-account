@@ -1,0 +1,107 @@
+{
+  "name": "claude-accounts",
+  "displayName": "Account Switcher for Claude Code (unofficial)",
+  "description": "Usage of all your saved Claude accounts in the status bar and a full window to switch accounts, run them in terminals and set auto-switch. Needs the claude-multi-account scripts.",
+  "version": "0.5.1",
+  "publisher": "claude-multi-account",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeAccounts.open",
+        "title": "Claude Accounts: Open"
+      },
+      {
+        "command": "claudeAccounts.pick",
+        "title": "Claude Accounts: Quick menu"
+      },
+      {
+        "command": "claudeAccounts.runInTerminal",
+        "title": "Claude Accounts: Run Claude in a new terminal as account"
+      },
+      {
+        "command": "claudeAccounts.toggleAuto",
+        "title": "Claude Accounts: Turn auto-switch on/off"
+      },
+      {
+        "command": "claudeAccounts.setThreshold",
+        "title": "Claude Accounts: Set auto-switch limit"
+      },
+      {
+        "command": "claudeAccounts.accountSettings",
+        "title": "Claude Accounts: Per-account settings"
+      },
+      {
+        "command": "claudeAccounts.mapFolder",
+        "title": "Claude Accounts: Map this folder to an account"
+      },
+      {
+        "command": "claudeAccounts.toggleWrapper",
+        "title": "Claude Accounts: Panel follows folder maps (experimental) on/off"
+      },
+      {
+        "command": "claudeAccounts.refresh",
+        "title": "Claude Accounts: Refresh usage"
+      },
+      {
+        "command": "claudeAccounts.help",
+        "title": "Claude Accounts: Help"
+      },
+      {
+        "command": "claudeAccounts.exportSettings",
+        "title": "Claude Accounts: Export settings (no logins)"
+      },
+      {
+        "command": "claudeAccounts.exportLogins",
+        "title": "Claude Accounts: Export logins (encrypted)"
+      },
+      {
+        "command": "claudeAccounts.import",
+        "title": "Claude Accounts: Import"
+      },
+      {
+        "command": "claudeAccounts.switchTo",
+        "title": "Claude Accounts: Switch to account"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Accounts",
+      "properties": {
+        "claudeAccounts.backgroundRefreshMinutes": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Read the usage of all accounts in the background every this many minutes. 0 (default) reads only while the accounts window is open, because Anthropic limits how often usage can be read and Claude Code reads it too."
+        }
+      }
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "claudeAccounts.switchTo",
+          "when": "false"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "claudeAccounts.open",
+        "key": "ctrl+alt+a",
+        "mac": "cmd+alt+a"
+      }
+    ]
+  }
+}

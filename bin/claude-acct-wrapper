@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""VS Code Claude panel wrapper (claudeCode.claudeProcessWrapper), experimental.
+
+The extension starts the panel's Claude as:  <this file> <path to claude binary> <arguments...>
+with the workspace folder as the working directory. If `claude-acct wrapper on` is set and the
+folder is mapped (`claude-acct map`), Claude starts as the mapped account in a parallel session;
+otherwise it starts exactly as without the wrapper. Any problem here falls back to the plain start.
+"""
+import os
+import sys
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def load_acct():
+    loader = SourceFileLoader("claude_acct", str(HERE / "claude-acct"))
+    mod = module_from_spec(spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK):
+        real, args = argv[0], argv[1:]
+    elif argv and os.sep in argv[0] and Path(argv[0]).name.startswith("claude"):
+        real, args = None, argv[1:]  # a claude path that is gone (extension updated): find another
+    else:
+        real, args = None, argv
+    env = dict(os.environ)
+    acct = None
+    try:
+        acct = load_acct()
+        if "CLAUDE_CONFIG_DIR" not in env:
+            c = acct.conf()
+            if c.get("wrapper", {}).get("enabled"):
+                name = acct.mapped_account(os.getcwd(), c)
+                if name and name in acct.profiles():
+                    mod = acct.status_module()
+                    if mod.main_active(acct.profiles()) != name:
+                        env["CLAUDE_CONFIG_DIR"] = str(mod.claim(name))
+    except Exception as e:  # never keep the panel from starting
+        print(f"claude-acct-wrapper: {e}; starting with the main login", file=sys.stderr)
+        env = dict(os.environ)
+    if real is None:
+        real = acct.find_claude() if acct else "claude"
+    os.execve(real, [real, *args], env)
+
+
+if __name__ == "__main__":
+    main()

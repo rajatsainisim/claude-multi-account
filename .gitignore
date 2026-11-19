@@ -1,0 +1,12 @@
+# Never commit logins or tokens
+accounts/
+.backup/
+.credentials.json
+.claude.json
+*.credentials*
+*token*
+*.bak*
+.env
+__pycache__/
+dist/
+*.vsix

@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Ctrl+Alt+A picker: show every saved Claude account with its usage, then switch.
+
+Usage comes from claude-acct-status; the switch itself always goes through `claude-acct use`.
+If anything goes wrong while reading usage, it falls back to the plain `claude-acct` picker.
+Works without Claude itself, so it also helps when the active account is out of limit.
+"""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+
+RUN = "--run" in sys.argv[1:]  # Ctrl+Alt+Shift+A: run Claude in this terminal as the picked account
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+ACCT = os.path.join(BIN, "claude-acct")
+
+
+def fallback(reason):
+    print(f"(usage not available: {reason}; showing the plain picker)\n")
+    os.execv(sys.executable, [sys.executable, ACCT])
+
+
+def load_status():
+    path = os.path.join(BIN, "claude-acct-status")
+    loader = SourceFileLoader("claude_acct_status", path)
+    mod = module_from_spec(spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def short(mod, lim):
+    if not lim:
+        return ""
+    p = int(round(lim["percent"] or 0))
+    reset = "resets " + mod.when(lim["resets_at"]).split(" (in")[0] if lim["resets_at"] else "not started"
+    return f"{lim['label']:<5}{p:>4}%  {reset}"
+
+
+def peak(r):
+    week = max((l["percent"] or 0 for l in r["limits"] if l["label"].startswith("week")), default=0)
+    five = max((l["percent"] or 0 for l in r["limits"] if l["label"] == "5h"), default=0)
+    return week, five
+
+
+def main():
+    try:
+        mod = load_status()
+        print("Checking usage of all accounts...", flush=True)
+        profs = {p.stem: mod.load(p) for p in sorted(mod.STORE.glob("*.json"))}
+        if not profs:
+            fallback("no saved accounts")
+        live_uuid = (mod.load(mod.GLOBAL).get("oauthAccount") or {}).get("accountUuid")
+        live_tokens = mod.load(mod.CREDS).get("claudeAiOauth") or {}
+
+        def is_active(prof):
+            o = prof.get("claudeAiOauth") or {}
+            if live_tokens.get("refreshToken") and o.get("refreshToken") == live_tokens.get("refreshToken"):
+                return True
+            return bool(live_uuid) and (prof.get("oauthAccount") or {}).get("accountUuid") == live_uuid
+
+        with mod.cf.ThreadPoolExecutor(max_workers=8) as ex:
+            rows = list(ex.map(lambda kv: mod.check(kv[0], kv[1], is_active(kv[1])), profs.items()))
+    except SystemExit:
+        raise
+    except Exception as e:  # never block switching because of the usage part
+        fallback(e.__class__.__name__)
+
+    rows.sort(key=lambda r: (not r["active"], r["name"]))
+    cfg = mod.load(mod.STORE / ".claude-acct.conf")
+    mapped = None
+    here = Path.cwd().resolve()
+    for d in (here, *here.parents):
+        if str(d) in cfg.get("maps", {}):
+            mapped = cfg["maps"][str(d)]
+            break
+    auto = cfg.get("auto", {})
+    disabled = set(cfg.get("disabled", []))
+    thresholds = cfg.get("thresholds", {})
+    print("\033[2J\033[H", end="")
+    title = "Run Claude in this terminal as" if RUN else "Claude accounts"
+    print(f"{title}  ({mod.dt.datetime.now(mod.TZ).strftime('%d %b %I:%M %p')})")
+    if auto.get("enabled"):
+        print(f"Auto-switch: ON at {auto.get('threshold', 95)}%  (claude-acct auto off)\n")
+    else:
+        print("Auto-switch: OFF  (claude-acct auto on)\n")
+    for i, r in enumerate(rows, 1):
+        tags = ["<- active"] if r["active"] else []
+        if r.get("session"):
+            tags.append("[parallel session running]")
+        if r["name"] == mapped:
+            tags.append("[mapped to this folder]")
+        if r["name"] in disabled:
+            tags.append("[auto: disabled]")
+        if r["name"] in thresholds:
+            tags.append(f"[auto at {thresholds[r['name']]}%]")
+        print(f"  {i}. {r['email']} [{r['plan'] or '?'}]{'  ' + ' '.join(tags) if tags else ''}")
+        if r["error"]:
+            print(f"       ! {r['error']}")
+            continue
+        five = next((l for l in r["limits"] if l["label"] == "5h"), None)
+        week = next((l for l in r["limits"] if l["label"] == "week"), None)
+        print(f"       {short(mod, five):<38}{short(mod, week)}")
+        for l in r["limits"]:
+            if l["label"].startswith("week ") and (l["percent"] or 0) > 0:
+                print(f"       {'':<38}{l['label']} {int(round(l['percent']))}%")
+
+    usable = [r for r in rows if not r["error"] and peak(r)[0] < 95 and peak(r)[1] < 95
+              and (RUN or not r.get("session"))]
+    if RUN and mapped and any(r["name"] == mapped for r in rows):
+        print(f"\nThis folder is mapped to {mapped} ({rows.index(next(r for r in rows if r['name'] == mapped)) + 1}).")
+    elif usable:
+        best = min(usable, key=peak)
+        n = rows.index(best) + 1
+        note = "  (already active, no need to switch)" if best["active"] and not RUN else ""
+        print(f"\nSuggested: {n} ({best['email']}){note}")
+    else:
+        print("\nAll accounts are near their limit; check the reset times above.")
+
+    if RUN:
+        choice = input("\nRun Claude in THIS terminal as number (Enter = cancel): ").strip()
+        if not choice:
+            return
+        if not choice.isdigit() or not 1 <= int(choice) <= len(rows):
+            sys.exit("Invalid choice")
+        os.execv(ACCT, [ACCT, "run", rows[int(choice) - 1]["name"]])
+    choice = input("\nNumber to switch (Enter = cancel): ").strip()
+    if not choice:
+        return
+    if not choice.isdigit() or not 1 <= int(choice) <= len(rows):
+        sys.exit("Invalid choice")
+    target = rows[int(choice) - 1]
+    if target["active"]:
+        print("Already active.")
+        return
+    if target.get("session"):
+        sys.exit(f"{target['email']} is in use in a parallel session; close it first or pick another account.")
+    rc = subprocess.call([ACCT, "use", target["name"]])
+    if rc == 0:
+        print("Done. Keep chatting in the same Claude chat; the next message uses this account.")
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1194 @@
+#!/usr/bin/env python3
+"""Keep several Claude logins and switch between them without logging out.
+
+  claude-acct save [name]   save the account that is logged in now (name defaults to its email)
+  claude-acct use <name>    switch to a saved account (saves fresh tokens of the current one first)
+  claude-acct list [--json] show saved accounts, * marks the active one
+  claude-acct               interactive picker (numbered list)
+  claude-acct current       print the active account name
+  claude-acct remove <name> forget a saved account
+  claude-acct add-token <email>  add an account from access (+ refresh) token, no browser
+                            the token is read from a hidden prompt or stdin, never from argv
+
+  claude-acct auto [status]          auto-switch settings and last switch
+  claude-acct auto on|off            turn auto-switch on or off (off by default)
+  claude-acct auto threshold <50-100> [--account NAME]
+                            switch away at this 5-hour/weekly % (default 95; 100 = only when the
+                            limit is actually hit); --unset --account NAME removes an override
+  claude-acct auto check [--dry-run] run one decision now (dry run: only say what would happen)
+  claude-acct disable|enable <name>  keep an account out of / back in auto-switch
+  claude-acct hook stop|tool|prompt|stop-failure  used by the Claude Code hooks
+
+Only the claude.ai login is swapped (claudeAiOauth in ~/.claude/.credentials.json and
+oauthAccount in ~/.claude.json). MCP logins, history, sessions and settings stay shared,
+so the same conversation continues after a switch.
+"""
+import json
+import os
+import sys
+import getpass
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid as uuidlib
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+# CREDS/GLOBAL: the login THIS process belongs to (the main one, or a parallel session's)
+CREDS = CONFIG_DIR / ".credentials.json"
+GLOBAL = (CONFIG_DIR / ".claude.json") if "CLAUDE_CONFIG_DIR" in os.environ else Path.home() / ".claude.json"
+try:  # inside a parallel session the marker points back to the main setup
+    PROFILE = json.loads((CONFIG_DIR / ".claude-acct-profile").read_text())
+except (OSError, ValueError):
+    PROFILE = {}
+# saved accounts always live in the main setup, also when a hook runs inside a parallel session
+STORE = (Path(PROFILE["main_dir"]) if PROFILE else CONFIG_DIR) / "accounts"
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def write_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def has_tokens(oauth):
+    """A usable login has an access token and, unless it is a long-lived setup token, a refresh token."""
+    return bool(oauth and oauth.get("accessToken") and (oauth.get("refreshToken") or oauth.get("expiresAt", 0) > time.time() * 1000))
+
+
+def backup(name):
+    """Keep the last 5 copies of a saved account before it is replaced."""
+    src = STORE / f"{name}.json"
+    if not src.exists():
+        return
+    bdir = STORE / ".backup"
+    bdir.mkdir(mode=0o700, exist_ok=True)
+    write_atomic(bdir / f"{name}.{int(time.time())}.json", load(src))
+    old = sorted(bdir.glob(f"{name}.*.json"))[:-5]
+    for o in old:
+        o.unlink()
+
+
+def profiles():
+    STORE.mkdir(mode=0o700, exist_ok=True)
+    return {p.stem: load(p) for p in sorted(STORE.glob("*.json"))}
+
+
+def live():
+    return load(CREDS).get("claudeAiOauth"), load(GLOBAL).get("oauthAccount")
+
+
+def token_account(oauth):
+    """Ask Anthropic which account a token belongs to; ~/.claude.json can lag behind a /login."""
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/profile",
+        headers={"Authorization": f"Bearer {oauth['accessToken']}", "anthropic-beta": "oauth-2025-04-20"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    acc, org = data.get("account", {}), data.get("organization", {})
+    return {
+        "accountUuid": acc.get("uuid"),
+        "emailAddress": acc.get("email"),
+        "displayName": acc.get("display_name"),
+        "organizationUuid": org.get("uuid"),
+        "organizationName": org.get("name"),
+    }
+
+
+def whoami():
+    """(uuid, oauthAccount) of the live login, trusting the token over the cached profile."""
+    oauth, cached = live()
+    if not oauth:
+        return None, None
+    fresh = token_account(oauth)
+    if fresh and fresh["accountUuid"]:
+        if cached and cached.get("accountUuid") == fresh["accountUuid"]:
+            return fresh["accountUuid"], cached
+        return fresh["accountUuid"], fresh
+    # offline: fall back to the cached profile
+    return (cached or {}).get("accountUuid"), cached
+
+
+def name_for(uuid):
+    for name, prof in profiles().items():
+        if uuid and prof.get("oauthAccount", {}).get("accountUuid") == uuid:
+            return name
+    return None
+
+
+def active_name():
+    return name_for(whoami()[0])
+
+
+def save(name=None):
+    oauth, _ = live()
+    if not has_tokens(oauth):
+        sys.exit("The current login has no tokens (signed out or expired). Run /login first; nothing was saved.")
+    uuid, account = whoami()
+    if not oauth or not uuid:
+        sys.exit("No claude.ai login found. Run /login first.")
+    known = name_for(uuid)
+    if known and profiles()[known]["oauthAccount"].keys() > account.keys():
+        account = profiles()[known]["oauthAccount"]  # keep the richer copy written by Claude Code
+    name = name or known or account.get("emailAddress")
+    if known and known != name:
+        (STORE / f"{known}.json").unlink()  # renaming an already saved account
+    prof = {"claudeAiOauth": oauth, "oauthAccount": account, "savedAt": int(time.time())}
+    backup(name)
+    write_atomic(STORE / f"{name}.json", prof)
+    return name
+
+
+def use(name):
+    if PROFILE:
+        sys.exit(f"This terminal runs Claude as {PROFILE.get('account')} (parallel session). "
+                 "Switch the main login from a normal terminal or with Ctrl+Alt+A.")
+    if name not in profiles():
+        sys.exit(f"No saved account '{name}'. Saved: {', '.join(profiles()) or 'none'}")
+    mod = status_module()
+    state = mod.session_state(name)
+    if state == "running":
+        sys.exit(f"{name} is in use in a parallel session (claude-acct run or a mapped VS Code folder). "
+                 "Close that session first, or pick another account.")
+    if state == "idle":
+        mod.release(name)  # take its newest tokens back before activating it
+    target = profiles().get(name)
+    oauth = target["claudeAiOauth"]
+    if not target.get("tokenOnly") and oauth.get("expiresAt", 0) > time.time() * 1000 + 60_000 and not token_account(oauth):
+        sys.exit(f"Saved login for '{name}' no longer works (signed out or revoked). "
+                 f"Log in to it again with /login, then run: claude-acct save {name}")
+    if has_tokens(live()[0]):
+        # keep the current account's refreshed tokens (or a fresh, unsaved /login) before overwriting
+        print(f"Saved current login as {save()}")
+    target = profiles()[name]
+    creds = load(CREDS)
+    creds["claudeAiOauth"] = target["claudeAiOauth"]
+    write_atomic(CREDS, creds)
+    glob = load(GLOBAL)
+    glob["oauthAccount"] = target["oauthAccount"]
+    write_atomic(GLOBAL, glob)
+    print(f"Switched to {name} ({target['oauthAccount'].get('emailAddress')})")
+
+
+def add_token(email):
+    """Save an account from tokens (access + optional refresh) without any browser login."""
+    if sys.stdin.isatty():
+        token = getpass.getpass(f"Access token for {email} (hidden): ").strip()
+        refresh = getpass.getpass("Refresh token (hidden, Enter to skip): ").strip()
+    else:
+        lines = [l.strip() for l in sys.stdin.read().splitlines() if l.strip()]
+        token, refresh = (lines + ["", ""])[:2]
+    if not token.startswith("sk-ant-"):
+        sys.exit("Access token does not look right (expected sk-ant-oat...). Nothing saved.")
+    if refresh and not refresh.startswith("sk-ant-"):
+        sys.exit("Refresh token does not look right (expected sk-ant-ort...). Nothing saved.")
+    if token.startswith("sk-ant-ort") and refresh:
+        token, refresh = refresh, token  # pasted in the wrong order
+    oauth = {
+        "accessToken": token,
+        "refreshToken": refresh or None,
+        "expiresAt": int((time.time() + 365 * 86400) * 1000),
+        "scopes": ["user:inference"],
+        "subscriptionType": None,
+    }
+    if refresh:
+        oauth["scopes"] = ["user:inference", "user:profile", "user:sessions:claude_code"]
+    info = token_account(oauth)
+    token_only = not (info and info.get("accountUuid"))
+    if refresh:
+        # access token lifetime is unknown: if it works, assume 1h; if not, force Claude Code to refresh
+        oauth["expiresAt"] = int((time.time() + 3600) * 1000) if not token_only else 0
+    if token_only:
+        info = {
+            "accountUuid": str(uuidlib.uuid5(uuidlib.NAMESPACE_URL, f"claude-acct:{email}")),
+            "emailAddress": email,
+            "displayName": email.split("@")[0],
+        }
+        print("Note: could not verify the token with Anthropic; email taken from your input.")
+    elif info.get("emailAddress") and info["emailAddress"].lower() != email.lower():
+        print(f"Warning: token belongs to {info['emailAddress']}, not {email}. Saving under the real email.")
+    else:
+        print(f"Verified: token belongs to {info.get('emailAddress')}.")
+    name = info.get("emailAddress") or email
+    prof = {"claudeAiOauth": oauth, "oauthAccount": info, "savedAt": int(time.time()),
+            "tokenOnly": token_only}
+    STORE.mkdir(mode=0o700, exist_ok=True)
+    write_atomic(STORE / f"{name}.json", prof)
+    print(f"Saved as {name}. Switch with: claude-acct use {name}")
+
+
+def listing(as_json=False):
+    cur = active_name()
+    rows = [
+        {
+            "name": n,
+            "email": p.get("oauthAccount", {}).get("emailAddress"),
+            "plan": p.get("claudeAiOauth", {}).get("subscriptionType"),
+            "active": n == cur,
+        }
+        for n, p in profiles().items()
+    ]
+    if as_json:
+        print(json.dumps(rows))
+        return
+    if not rows:
+        print("No saved accounts. Log in, then run: claude-acct save <name>")
+    for r in rows:
+        print(f"{'*' if r['active'] else ' '} {r['name']:<20} {r['email']}  [{r['plan']}]")
+
+
+def autosave():
+    """Hook entry point: save the live login if it is new or its tokens were refreshed. Never fails."""
+    try:
+        oauth, _ = live()
+        if not has_tokens(oauth):
+            return
+        tokens = (oauth.get("accessToken"), oauth.get("refreshToken"))
+        for prof in profiles().values():
+            saved = prof.get("claudeAiOauth", {})
+            if (saved.get("accessToken"), saved.get("refreshToken")) == tokens:
+                return  # already saved as is, no network call needed
+        if whoami()[0]:
+            save()
+    except Exception:
+        pass
+
+
+def pick():
+    names = list(profiles())
+    if not names:
+        listing()
+        return
+    cur = active_name()
+    print("Claude accounts:\n")
+    for i, n in enumerate(names, 1):
+        p = profiles()[n]
+        mark = "  <- active" if n == cur else ""
+        print(f"  {i}. {p['oauthAccount'].get('emailAddress')}  [{p['claudeAiOauth'].get('subscriptionType')}]{mark}")
+    choice = input("\nNumber to switch (Enter = cancel): ").strip()
+    if not choice:
+        return
+    if not choice.isdigit() or not 1 <= int(choice) <= len(names):
+        sys.exit("Invalid choice")
+    target = names[int(choice) - 1]
+    if target == cur:
+        print("Already active.")
+        return
+    use(target)
+    print("Done. Keep chatting in the same Claude chat; the next message uses this account.")
+
+
+# ---------------------------------------------------------------- auto-switch
+# Driven by Claude Code hooks, no background process:
+#   Stop hook        -> `claude-acct hook stop`: after a reply, check the active account's usage
+#                       (throttled) and switch when it crosses its threshold
+#   StopFailure hook -> `claude-acct hook stop-failure`: the turn failed on a rate limit, switch now
+# Off by default. Config and state are plain JSON files in STORE whose names do not end in .json,
+# so they never show up as accounts.
+
+CONF = STORE / ".claude-acct.conf"
+STATE = STORE / ".auto-state"
+AUTO_DEFAULTS = {"enabled": False, "threshold": 95, "cooldownSec": 300, "checkEverySec": 180}
+
+
+def conf():
+    c = load(CONF)
+    auto = c.setdefault("auto", {})
+    for k, v in AUTO_DEFAULTS.items():
+        auto.setdefault(k, v)
+    c.setdefault("disabled", [])
+    c.setdefault("thresholds", {})
+    return c
+
+
+def save_conf(c):
+    STORE.mkdir(mode=0o700, exist_ok=True)
+    write_atomic(CONF, c)
+
+
+def threshold_for(c, name):
+    return c["thresholds"].get(name, c["auto"]["threshold"])
+
+
+def resolve(name):
+    """Accept a saved name, or a unique prefix of one (e.g. 'work' for work@example.com)."""
+    names = list(profiles())
+    if name in names:
+        return name
+    hits = [n for n in names if n.startswith(name)]
+    if len(hits) == 1:
+        return hits[0]
+    sys.exit(f"No single saved account matches '{name}'. Saved: {', '.join(names) or 'none'}")
+
+
+def status_module():
+    """Load claude-acct-status (next to this file) for its usage helpers."""
+    from importlib.machinery import SourceFileLoader
+    from importlib.util import module_from_spec, spec_from_loader
+    path = Path(__file__).resolve().parent / "claude-acct-status"
+    loader = SourceFileLoader("claude_acct_status", str(path))
+    mod = module_from_spec(spec_from_loader(loader.name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def active_local(profs):
+    """Active saved account without a network call: match the live refresh token, then the uuid."""
+    oauth, account = live()
+    oauth, account = oauth or {}, account or {}
+    for n, p in profs.items():
+        if oauth.get("refreshToken") and p.get("claudeAiOauth", {}).get("refreshToken") == oauth["refreshToken"]:
+            return n
+    uuid = account.get("accountUuid")
+    for n, p in profs.items():
+        if uuid and p.get("oauthAccount", {}).get("accountUuid") == uuid:
+            return n
+    return None
+
+
+def peak(row):
+    """(weekly %, 5-hour %) of a usage row from claude-acct-status."""
+    week = max((l["percent"] or 0 for l in row["limits"] if l["label"] == "week"), default=0)
+    five = max((l["percent"] or 0 for l in row["limits"] if l["label"] == "5h"), default=0)
+    return week, five
+
+
+def quiet_use(name):
+    """Switch without printing (hook stdout must stay JSON). Returns an error text or None."""
+    import contextlib
+    import io
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            use(name)
+    except SystemExit as e:
+        return str(e.code) if e.code not in (None, 0) else None
+    return None
+
+
+def auto_check(trigger="stop", dry_run=False, force=False):
+    """Run one auto-switch decision. Returns a message for the user, or None when nothing happened."""
+    c = conf()
+    a = c["auto"]
+    if not (a["enabled"] or dry_run or force):
+        return None
+    if PROFILE:  # a parallel session keeps the account it was started with
+        return None
+    st = load(STATE)
+    now = time.time()
+    profs = profiles()
+    cur = active_local(profs)
+    if not cur:
+        return None
+    limit_hit = trigger == "limit"
+    cur_thr = threshold_for(c, cur)
+
+    def save_state(state):
+        if not dry_run:  # a dry run must not delay the next real check
+            write_atomic(STATE, state)
+
+    if not limit_hit:
+        # throttle first, before any import or network call: this runs after every tool call
+        interval = a["checkEverySec"]  # usage reads are limited (~30/hour per account): never faster
+        if not (dry_run or force) and st.get("active") == cur and now - st.get("lastCheck", 0) < interval:
+            return None
+    mod = status_module()
+
+    if limit_hit:
+        cur_peak = 100
+    else:
+        row = mod.check(cur, profs[cur], True)
+        if not dry_run:
+            mod.share_reading([row], full=False)  # the VS Code status bar shows it for free
+        st.update(lastCheck=now, active=cur)
+        if row["error"]:
+            save_state(st)
+            return f"Auto-switch: could not read usage of {cur} ({row['error']})." if dry_run else None
+        cur_peak = max(peak(row))
+        st["lastPeak"] = cur_peak
+        if cur_peak < cur_thr:
+            save_state(st)
+            return f"Auto-switch: {cur} is at {cur_peak}% (switches at {cur_thr}%), nothing to do." if dry_run else None
+        if cur_peak < 100 and now - st.get("lastSwitch", 0) < a["cooldownSec"] and not dry_run:
+            save_state(st)
+            return None
+
+    candidates = {n: p for n, p in profs.items() if n != cur and n not in c["disabled"]}
+    with mod.cf.ThreadPoolExecutor(max_workers=8) as ex:
+        rows = list(ex.map(lambda kv: mod.check(kv[0], kv[1], False), candidates.items()))
+    usable = [r for r in rows if not r["error"] and not r.get("session")
+              and max(peak(r)) < threshold_for(c, r["name"])]
+    why = "hit its limit" if limit_hit else f"is at {cur_peak}%"
+    if not usable:
+        st["lastPeak"] = cur_peak
+        msg = None
+        if dry_run or now - st.get("lastWarn", 0) > 1800:
+            st["lastWarn"] = now
+            msg = f"Auto-switch: {cur} {why}, but every other account is near its limit too. Run claude-acct-status for reset times."
+        save_state(st)
+        return msg
+    best = min(usable, key=peak)
+    w, f5 = peak(best)
+    if dry_run:
+        return f"[dry run] {cur} {why}: would switch to {best['name']} (week {w}%, 5h {f5}%)."
+    err = quiet_use(best["name"])
+    if err:
+        save_state(st)
+        return f"Auto-switch to {best['name']} failed: {err}"
+    st.update(lastSwitch=now, lastPeak=max(w, f5), active=best["name"], lastCheck=now,
+              lastEvent={"at": int(now), "from": cur, "to": best["name"], "reason": why})
+    save_state(st)
+    tail = " Send your message again." if limit_hit else ""
+    return f"Auto-switch: {cur} {why}, switched to {best['name']} (week {w}%, 5h {f5}%).{tail}"
+
+
+def hook(kind):
+    """Hook entry point. Never fails, prints only hook JSON."""
+    try:
+        raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+        payload = json.loads(raw) if raw.strip() else {}
+        if not conf()["auto"]["enabled"]:
+            return
+        import fcntl
+        with open(STORE / ".auto.lock", "w") as lock:
+            try:  # parallel tool calls fire several hooks at once: one decides, the rest leave
+                fcntl.flock(lock, fcntl.LOCK_EX | (0 if kind == "stop-failure" else fcntl.LOCK_NB))
+            except BlockingIOError:
+                return
+            if kind in ("stop", "tool", "prompt"):
+                msg = auto_check("stop")
+            elif kind == "stop-failure":
+                err = json.dumps([payload.get("error"), payload.get("error_details")]).lower()
+                if "rate_limit" not in err and "rate limit" not in err and "usage limit" not in err:
+                    return
+                msg = auto_check("limit")
+            else:
+                return
+        if msg:
+            print(json.dumps({"systemMessage": msg}))
+    except Exception:
+        pass
+
+
+def auto_cmd(args):
+    c = conf()
+    sub = args[0] if args else "status"
+    if sub in ("on", "off"):
+        c["auto"]["enabled"] = sub == "on"
+        save_conf(c)
+        print(f"Auto-switch {'ON' if sub == 'on' else 'OFF'}.")
+    elif sub == "threshold":
+        rest = args[1:]
+        acct = None
+        if "--account" in rest:
+            i = rest.index("--account")
+            acct = resolve(rest[i + 1])
+            rest = rest[:i] + rest[i + 2:]
+        if rest == ["--unset"] and acct:
+            c["thresholds"].pop(acct, None)
+            save_conf(c)
+            print(f"{acct} now uses the default threshold ({c['auto']['threshold']}%).")
+            return
+        if len(rest) != 1 or not rest[0].isdigit() or not 50 <= int(rest[0]) <= 100:
+            sys.exit("Usage: claude-acct auto threshold <50-100> [--account NAME] | --unset --account NAME\n"
+                     "100 = use an account fully; switch only when its limit is actually hit.")
+        if acct:
+            c["thresholds"][acct] = int(rest[0])
+        else:
+            c["auto"]["threshold"] = int(rest[0])
+        save_conf(c)
+        print(f"Threshold for {acct or 'all accounts'}: {rest[0]}%.")
+    elif sub == "check":
+        print(auto_check("stop", dry_run="--dry-run" in args, force=True) or "Nothing to do.")
+    elif sub == "status":
+        a = c["auto"]
+        print(f"Auto-switch: {'ON' if a['enabled'] else 'OFF'}   default threshold {a['threshold']}% "
+              f"(5-hour or weekly)   cooldown {a['cooldownSec'] // 60} min")
+        for n in profiles():
+            tags = []
+            if n in c["thresholds"]:
+                tags.append(f"threshold {c['thresholds'][n]}%")
+            if n in c["disabled"]:
+                tags.append("disabled (never switched to)")
+            print(f"  {n}{'  - ' + ', '.join(tags) if tags else ''}")
+        ev = load(STATE).get("lastEvent")
+        if ev:
+            when = time.strftime("%d %b %H:%M", time.localtime(ev["at"]))
+            print(f"Last auto-switch: {when}  {ev['from']} -> {ev['to']} ({ev['reason']})")
+    else:
+        sys.exit("Usage: claude-acct auto [status|on|off|check [--dry-run]|threshold <50-100> [--account NAME]]")
+
+
+def timezone_cmd(args):
+    """Show reset times in this time zone (useful on cloud VMs that run on UTC)."""
+    c = conf()
+    if not args:
+        print(f"Time zone for reset times: {c.get('timezone') or 'system default'}")
+        return
+    if args[0] == "--unset":
+        c.pop("timezone", None)
+        save_conf(c)
+        print("Reset times use the system time zone again.")
+        return
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(args[0])
+    except Exception:
+        sys.exit(f"Unknown time zone '{args[0]}'. Use an Area/City name, e.g. Europe/Berlin or America/New_York.")
+    c["timezone"] = args[0]
+    save_conf(c)
+    print(f"Reset times are shown in {args[0]}.")
+
+
+def set_disabled(name, disabled):
+    c = conf()
+    name = resolve(name)
+    c["disabled"] = [n for n in c["disabled"] if n != name] + ([name] if disabled else [])
+    save_conf(c)
+    print(f"{name}: {'disabled, auto-switch will not use it' if disabled else 'enabled for auto-switch'}.")
+
+
+# ------------------------------------------------------------ parallel sessions
+# The session logic (claim/release/state) lives in claude-acct-status, shared with the wrapper.
+
+def find_claude():
+    """The Claude Code CLI: on PATH, ~/.local/bin, or the binary bundled with the VS Code extension."""
+    import glob
+    import shutil
+    me = Path(__file__).resolve()
+    for c in (shutil.which("claude"), str(Path.home() / ".local/bin/claude")):
+        if c and os.access(c, os.X_OK) and Path(c).resolve() != me:
+            return c
+    found = [c for c in glob.glob(str(Path.home() / ".vscode*/extensions/anthropic.claude-code-*/resources/"
+                                       "native-binar*/**/claude"), recursive=True) if os.access(c, os.X_OK)]
+    if found:
+        return max(found, key=os.path.getmtime)
+    sys.exit("Claude Code CLI not found. Install it, or open VS Code once with the Claude extension.")
+
+
+def mapped_account(folder, c=None):
+    """Account mapped to this folder or its nearest mapped parent."""
+    maps = (c or conf()).get("maps", {})
+    p = Path(folder).resolve()
+    for d in (p, *p.parents):
+        if str(d) in maps:
+            return maps[str(d)]
+    return None
+
+
+def run(args):
+    extra = []
+    if "--" in args:
+        i = args.index("--")
+        args, extra = args[:i], args[i + 1:]
+    name = resolve(args[0]) if args else mapped_account(os.getcwd())
+    if not name:
+        sys.exit("Usage: claude-acct run <name> [-- claude arguments]\n"
+                 "   or map this folder once (claude-acct map <name>) and just run: claude-acct run")
+    claude = find_claude()
+    mod = status_module()
+    env = dict(os.environ)
+    for k in ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_ENTRYPOINT"):
+        env.pop(k, None)  # a fresh top-level session, even when started from inside Claude (as VS Code does)
+    main_dir = Path(PROFILE["main_dir"]) if PROFILE else CONFIG_DIR
+    if mod.main_active(profiles()) == name:
+        # it is the main login already: plain Claude, sharing the main login
+        if main_dir == Path.home() / ".claude":
+            env.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            env["CLAUDE_CONFIG_DIR"] = str(main_dir)
+        print(f"{name} is the main login: starting Claude normally.", file=sys.stderr)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(mod.claim(name))
+        print(f"Claude as {name} in this terminal only. Other terminals and the VS Code panel keep their "
+              f"account; settings, skills and history are shared.", file=sys.stderr)
+    os.execve(claude, [claude, *extra], env)
+
+
+def map_cmd(args, remove=False):
+    c = conf()
+    maps = c.setdefault("maps", {})
+    if remove:
+        folder = str(Path(args[0] if args else os.getcwd()).resolve())
+        if maps.pop(folder, None) is None:
+            sys.exit(f"{folder} is not mapped. Mapped: {', '.join(maps) or 'none'}")
+        save_conf(c)
+        print(f"Unmapped {folder}.")
+        return
+    if not args:
+        for folder, name in sorted(maps.items()):
+            print(f"  {folder}  ->  {name}")
+        print("" if maps else "No folders mapped. Map one with: claude-acct map <name> [folder]")
+        print(f"VS Code panel follows these maps: {'yes' if c.get('wrapper', {}).get('enabled') else 'no'} "
+              "(claude-acct wrapper on|off)")
+        return
+    name = resolve(args[0])
+    folder = str(Path(args[1] if len(args) > 1 else os.getcwd()).resolve())
+    maps[folder] = name
+    save_conf(c)
+    print(f"{folder} (and its subfolders) -> {name}\n"
+          f"  terminal: claude-acct run   (or Ctrl+Alt+Shift+A in VS Code)")
+    if c.get("wrapper", {}).get("enabled"):
+        print("  VS Code panel: reload the window (Developer: Reload Window) to start it as this account")
+    else:
+        print("  VS Code panel: only with the experimental wrapper (claude-acct help parallel)")
+
+
+def sessions_cmd():
+    mod = status_module()
+    c = conf()
+    rows = []
+    for name in profiles():
+        state = mod.session_state(name)
+        folders = [f for f, n in c.get("maps", {}).items() if n == name]
+        if state != "none" or folders:
+            pids = mod.profile_pids(name) if state == "running" else []
+            rows.append(f"  {name:<28} {state:<8} {'pids ' + ','.join(map(str, pids)) if pids else ''}"
+                        f"{'  folders: ' + ', '.join(folders) if folders else ''}")
+    print("\n".join(rows) if rows else "No parallel sessions and no mapped folders.")
+
+
+def vscode_machine_settings():
+    """VS Code settings files where machine-scoped settings of the Claude extension are read."""
+    h = Path.home()
+    files = [h / ".config/Code/User/settings.json", h / ".config/Code - Insiders/User/settings.json",
+             h / "Library/Application Support/Code/User/settings.json"]
+    files = [f for f in files if f.parent.is_dir()]
+    if (h / ".vscode-server").is_dir():  # Remote-SSH host: machine settings live here
+        files.append(h / ".vscode-server/data/Machine/settings.json")
+    return files
+
+
+def wrapper_cmd(args):
+    c = conf()
+    w = c.setdefault("wrapper", {"enabled": False, "added": {}})
+    w.setdefault("added", {})
+    sub = args[0] if args else "status"
+    if sub == "on":
+        mode = (load((Path(PROFILE["main_dir"]) if PROFILE else CONFIG_DIR) / "settings.json")
+                .get("permissions", {}).get("defaultMode"))
+        wanted = {"claudeCode.claudeProcessWrapper": str(Path.home() / ".local/bin/claude-acct-wrapper")}
+        if mode:  # with a wrapper the extension otherwise starts every chat in "default" permission mode
+            wanted["claudeCode.initialPermissionMode"] = mode
+        for f in vscode_machine_settings():
+            try:
+                data = json.loads(f.read_text()) if f.exists() and f.read_text().strip() else {}
+            except ValueError:
+                print(f"! {f} has comments, not changed. Add by hand:\n    " +
+                      ",\n    ".join(f'"{k}": "{v}"' for k, v in wanted.items()))
+                continue
+            added = [k for k in wanted if k not in data]
+            if not added:
+                continue
+            if f.exists():
+                f.with_name(f"{f.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}").write_text(f.read_text())
+            f.parent.mkdir(parents=True, exist_ok=True)
+            data.update({k: wanted[k] for k in added})
+            f.write_text(json.dumps(data, indent=4) + "\n")
+            w["added"][str(f)] = sorted(set(w["added"].get(str(f), [])) | set(added))
+            print(f"  {f}: set {', '.join(added)}")
+        w["enabled"] = True
+        save_conf(c)
+        print("Wrapper ON. Reload VS Code windows (Developer: Reload Window). Mapped folders now open the "
+              "panel as their account; other folders use the main login as before.")
+    elif sub == "off":
+        for fname, keys in list(w["added"].items()):
+            f = Path(fname)
+            try:
+                data = json.loads(f.read_text())
+            except (OSError, ValueError):
+                print(f"! could not edit {f}; remove {', '.join(keys)} by hand")
+                continue
+            for k in keys:
+                data.pop(k, None)
+            f.write_text(json.dumps(data, indent=4) + "\n")
+            print(f"  {f}: removed {', '.join(keys)}")
+        w.update(enabled=False, added={})
+        save_conf(c)
+        print("Wrapper OFF. Reload VS Code windows.")
+    else:
+        print(f"Wrapper: {'ON' if w.get('enabled') else 'OFF'} (experimental; VS Code panel follows folder maps)")
+        for f, keys in w.get("added", {}).items():
+            print(f"  {f}: {', '.join(keys)}")
+
+
+# ------------------------------------------------------------ export / import / move
+# Three ways to bring accounts to another machine; the user picks one each time:
+#   settings only  : auto-switch settings, limits, folder maps and the list of accounts, no logins.
+#                    The other machine logs in to each account itself (the safest way).
+#   with logins    : the saved logins too, encrypted with a password (or plain, if asked).
+#                    Both machines then hold the same login: if both use it, one of them will be
+#                    logged out when the other refreshes it. Use it for a backup or a one-way copy.
+#   move           : sends logins straight to another machine over SSH and forgets them here, so
+#                    each login lives in one place only.
+
+EXPORT_FORMAT = "claude-multi-account"
+ENC_MAGIC = b"Salted__"  # openssl enc output
+
+
+def _password(confirm):
+    pw = os.environ.get("CLAUDE_ACCT_PASSWORD")
+    if pw:
+        return pw
+    if not sys.stdin.isatty():
+        sys.exit("A password is needed: run this in a terminal, or set CLAUDE_ACCT_PASSWORD.")
+    pw = getpass.getpass("Password for the export file: ")
+    if confirm and getpass.getpass("Same password again: ") != pw:
+        sys.exit("The passwords differ. Nothing was written.")
+    if len(pw) < 8:
+        sys.exit("Use a password of at least 8 characters.")
+    return pw
+
+
+def _openssl(data, password, decrypt):
+    import shutil
+    import subprocess
+    if not shutil.which("openssl"):
+        sys.exit("openssl is needed for encrypted files (sudo apt install openssl).")
+    args = ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-salt", "-pass", "env:CLAUDE_ACCT_PASSWORD"]
+    if decrypt:
+        args.append("-d")
+    res = subprocess.run(args, input=data, capture_output=True, env={**os.environ, "CLAUDE_ACCT_PASSWORD": password})
+    if res.returncode != 0:
+        sys.exit("Wrong password, or the file is damaged." if decrypt else "Encryption failed.")
+    return res.stdout
+
+
+def build_export(names, with_logins):
+    c = conf()
+    profs = profiles()
+    accounts = []
+    for n in names:
+        p = profs[n]
+        entry = {"name": n, "email": p.get("oauthAccount", {}).get("emailAddress") or n,
+                 "plan": p.get("claudeAiOauth", {}).get("subscriptionType")}
+        if with_logins:
+            entry["login"] = {"claudeAiOauth": p["claudeAiOauth"], "oauthAccount": p.get("oauthAccount", {})}
+        accounts.append(entry)
+    return {"format": EXPORT_FORMAT, "version": 1, "exportedAt": int(time.time()),
+            "settings": {"auto": c["auto"], "thresholds": c["thresholds"], "disabled": c["disabled"],
+                         "maps": c.get("maps", {})},
+            "accounts": accounts}
+
+
+def _take_accounts(args):
+    """--account NAME (repeatable) or all saved accounts."""
+    names, rest, i = [], [], 0
+    while i < len(args):
+        if args[i] == "--account" and i + 1 < len(args):
+            names.append(resolve(args[i + 1]))
+            i += 2
+        else:
+            rest.append(args[i])
+            i += 1
+    return (names or list(profiles())), rest
+
+
+def export_cmd(args):
+    names, args = _take_accounts(args)
+    out = None
+    if "-o" in args:
+        i = args.index("-o")
+        out = args[i + 1] if i + 1 < len(args) else sys.exit("-o needs a file name (or - for stdout)")
+    with_logins = "--with-logins" in args
+    encrypt = with_logins and "--plain" not in args
+    if not names:
+        sys.exit("No saved accounts to export.")
+    if with_logins:
+        mod = status_module()
+        busy = [n for n in names if mod.session_state(n) == "running"]
+        if busy:
+            sys.exit(f"{', '.join(busy)} run in a parallel session now; close it first so its newest login is exported.")
+        for n in names:
+            if mod.session_state(n) == "idle":
+                mod.release(n)
+        if has_tokens(live()[0]) and not PROFILE:
+            save()  # export the newest tokens of the account in use
+    data = json.dumps(build_export(names, with_logins), indent=2).encode()
+    if encrypt:
+        data = _openssl(data, _password(confirm=True), decrypt=False)
+    if out is None:
+        out = str(Path.home() / f"claude-accounts-{'logins' if with_logins else 'settings'}-{time.strftime('%Y%m%d-%H%M')}"
+                  f"{'.cma' if encrypt else '.json'}")
+    if out == "-":
+        sys.stdout.buffer.write(data)
+        return
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.chmod(out, 0o600)
+    print(f"Exported {len(names)} account(s) to {out}", file=sys.stderr)
+    if with_logins:
+        print("Logins are included" + (" (encrypted)." if encrypt else " IN PLAIN TEXT: keep the file private.")
+              + " If this machine keeps using them too, one machine will be logged out when the other refreshes"
+                " a login; for a real move use: claude-acct move <name> --to <host>", file=sys.stderr)
+    else:
+        print("No logins inside: on the other machine run /login once per account.", file=sys.stderr)
+
+
+def read_export(path):
+    raw = sys.stdin.buffer.read() if path == "-" else Path(path).read_bytes()
+    if raw.startswith(ENC_MAGIC):
+        raw = _openssl(raw, _password(confirm=False), decrypt=True)
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        sys.exit("This is not a claude-acct export file.")
+    if data.get("format") != EXPORT_FORMAT:
+        sys.exit("This is not a claude-acct export file.")
+    return data
+
+
+def import_cmd(args):
+    if not args:
+        sys.exit("Usage: claude-acct import <file|-> [--replace] [--no-settings]")
+    data = read_export(args[0])
+    replace = "--replace" in args
+    lines = []
+    if "--no-settings" not in args:
+        s = data.get("settings") or {}
+        c = conf()
+        if s.get("auto"):
+            c["auto"].update({k: v for k, v in s["auto"].items() if k in AUTO_DEFAULTS})
+        c["thresholds"].update(s.get("thresholds") or {})
+        c["disabled"] = sorted(set(c["disabled"]) | set(s.get("disabled") or []))
+        maps = {f: n for f, n in (s.get("maps") or {}).items() if Path(f).is_dir()}  # only folders that exist here
+        c.setdefault("maps", {}).update(maps)
+        save_conf(c)
+        lines.append(f"settings: auto-switch {'on' if c['auto']['enabled'] else 'off'} at {c['auto']['threshold']}%, "
+                     f"{len(s.get('thresholds') or {})} own limit(s), {len(maps)} folder map(s)")
+    mod = status_module()
+    main_now = mod.main_active(profiles())
+    need_login = []
+    for a in data.get("accounts") or []:
+        name = a.get("name")
+        if not name or "/" in name or name.startswith("."):
+            continue
+        login = a.get("login")
+        exists = name in profiles()
+        if not login:
+            if not exists:
+                need_login.append(a.get("email") or name)
+            continue
+        if not has_tokens(login.get("claudeAiOauth")):
+            lines.append(f"{name}: skipped (the login in the file is incomplete)")
+            continue
+        if exists and not replace:
+            lines.append(f"{name}: already saved here, kept as is (use --replace to take the file's login)")
+            continue
+        if name == main_now:
+            lines.append(f"{name}: in use on this machine now, kept as is")
+            continue
+        if mod.session_state(name) == "running":
+            lines.append(f"{name}: running in a parallel session here, kept as is")
+            continue
+        STORE.mkdir(mode=0o700, exist_ok=True)
+        backup(name)
+        write_atomic(STORE / f"{name}.json", {"claudeAiOauth": login["claudeAiOauth"],
+                                              "oauthAccount": login.get("oauthAccount", {}),
+                                              "savedAt": int(time.time())})
+        lines.append(f"{name}: {'replaced' if exists else 'imported'}")
+    if need_login:
+        lines.append("log in once with /login to: " + ", ".join(need_login))
+    print("Imported.\n  " + "\n  ".join(lines))
+
+
+def move_cmd(args):
+    if len(args) < 3 or "--to" not in args:
+        sys.exit("Usage: claude-acct move <name> --to <ssh host> [--ssh-command 'ssh -p 2222']")
+    name = resolve(args[0])
+    host = args[args.index("--to") + 1]
+    import shlex
+    import subprocess
+    ssh = shlex.split(args[args.index("--ssh-command") + 1]) if "--ssh-command" in args else ["ssh"]
+    mod = status_module()
+    if mod.main_active(profiles()) == name:
+        sys.exit(f"{name} is the account in use here. Switch to another one first (claude-acct use <other>).")
+    state = mod.session_state(name)
+    if state == "running":
+        sys.exit(f"{name} runs in a parallel session here; close it first.")
+    if state == "idle":
+        mod.release(name)
+    payload = json.dumps(build_export([name], with_logins=True)).encode()
+    remote = "$HOME/.local/bin/claude-acct import - --replace --no-settings"
+    res = subprocess.run([*ssh, host, remote], input=payload, capture_output=True)
+    out = (res.stdout + res.stderr).decode(errors="replace")
+    if res.returncode != 0 or f"{name}: imported" not in out and f"{name}: replaced" not in out:
+        sys.exit(f"The other machine did not take {name}; nothing was removed here.\n{out.strip()}")
+    backup(name)
+    (STORE / f"{name}.json").unlink()
+    print(f"Moved {name} to {host}. It is no longer saved here (a backup stays in {STORE / '.backup'}).")
+
+
+HELP = {
+    "overview": """\
+claude-acct - several Claude accounts on one machine, switch without logging out
+
+Quick start
+  Ctrl+Alt+A (VS Code) or claude-acct-pick   see usage of every account and switch
+  claude-acct help <topic>                     details: accounts, usage, auto, parallel, move, files
+
+Accounts                                       (help accounts)
+  claude-acct list                 saved accounts, * = active
+  claude-acct use <name>           switch to an account (name or its start, e.g. "work")
+  claude-acct save [name]          save the account you are logged in to now
+  claude-acct remove <name>        forget a saved account
+  claude-acct current              print the active account
+
+Usage                                          (help usage)
+  claude-acct-status               5-hour and weekly usage of every account
+  claude-acct-pick                 same, then pick a number to switch
+
+Auto-switch                                    (help auto)
+  claude-acct auto                 settings and the last automatic switch
+  claude-acct auto on|off          turn it on or off (off by default)
+  claude-acct auto threshold <50-100> [--account <name>]
+  claude-acct auto check --dry-run what it would do right now
+  claude-acct disable|enable <name>
+
+Parallel accounts                              (help parallel)
+  claude-acct run <name>           Claude as that account in this terminal only
+  claude-acct map <name> [folder]  this folder always uses that account (claude-acct run)
+  Ctrl+Alt+Shift+A (VS Code)       pick an account and run Claude in a new terminal
+  claude-acct sessions             parallel sessions and mapped folders
+  claude-acct wrapper on|off       experimental: VS Code panel follows folder maps too
+
+Another machine                                (help move)
+  claude-acct export               settings only (other machine logs in itself)
+  claude-acct export --with-logins logins too, encrypted with a password
+  claude-acct import <file>        bring an export in
+  claude-acct move <name> --to <ssh host>   hand a login over and forget it here
+
+In Claude Code chat: /switch-account and /usageall
+""",
+    "accounts": """\
+Accounts
+
+  claude-acct list [--json]
+      Saved accounts with their plan; * marks the one Claude Code uses now.
+
+  claude-acct use <name>
+      Switch Claude Code to that account. The current account's latest tokens are saved first.
+      The running chat continues; the next message goes out on the new account.
+      <name> can be the full email or a unique start of it: claude-acct use work
+
+  claude-acct save [name]
+      Save the account that is logged in now. Normally not needed: a hook saves every new
+      /login after the next reply. Give a name to rename it.
+
+  claude-acct remove <name>
+      Forget a saved account on this machine (does not log anything out).
+
+  claude-acct current
+      Print the active account's name.
+
+  claude-acct            (no arguments, in a terminal)
+      Plain numbered picker without usage. claude-acct-pick shows usage too.
+
+  Adding an account: run /login in Claude Code with the new account. Do NOT run /logout or
+  press Sign out first, that can invalidate the saved token of the current account.
+  If a saved login stops working: /login with that account, then claude-acct save <name>.
+""",
+    "usage": """\
+Usage
+
+  claude-acct-status [--json]
+      5-hour and weekly usage of every saved account, with reset times (and per-model weekly
+      limits when the plan has them). An inactive account whose token expired is refreshed and
+      saved back (backup first). The active account is never refreshed; Claude Code owns it.
+
+  claude-acct-pick          (Ctrl+Alt+A in VS Code)
+      Same list with numbers, auto-switch state and a suggested account; type a number to
+      switch, Enter to cancel. Works even when the active account is out of limit, because it
+      does not need Claude to answer.
+
+  /usageall in chat         Usage table inside Claude Code (needs an account with usage left).
+
+  claude-acct timezone [<Area/City> | --unset]
+      Show reset times in this time zone instead of the system's (cloud VMs often run on UTC).
+""",
+    "auto": """\
+Auto-switch
+
+  Runs from Claude Code hooks, no background process:
+  - after every reply, after every tool call during long tasks, and when you send a message
+    (Stop, PostToolUse, UserPromptSubmit hooks) it checks the active account's usage, at most
+    every 3 minutes (Anthropic allows about 30 usage reads per account per hour). When the 5-hour OR weekly usage
+    reaches the threshold, it switches to the account with the lowest usage and tells you so.
+  - when a reply fails because the limit is used up (StopFailure hook), it switches at once;
+    send your message again.
+  It never picks a disabled account or one that is itself over its threshold. After a switch it
+  waits 5 minutes before switching again (except when a limit is actually hit).
+
+  claude-acct auto                       settings, per-account overrides, last switch
+  claude-acct auto on | off              start / stop (off by default)
+  claude-acct auto threshold 95          switch away at 95% (default) for all accounts
+  claude-acct auto threshold 100         use accounts fully: switch only when a limit is hit
+  claude-acct auto threshold 80 --account work       one account gets its own line
+  claude-acct auto threshold --unset --account work  back to the default
+  claude-acct disable <name>             never auto-switch to this account
+  claude-acct enable <name>              allow it again
+  claude-acct auto check --dry-run       show what it would do now, without switching
+  claude-acct auto check                 run one check now (may switch)
+""",
+    "parallel": """\
+Parallel accounts: different accounts at the same time
+
+  claude-acct run <name> [-- claude arguments]
+      Start Claude Code as <name> in THIS terminal only. Everything else (other terminals, the
+      VS Code panel) keeps its account. Settings, skills, plugins, MCP servers and chat history are
+      shared; only the login differs. In a VS Code terminal the IDE connection (diffs) works too.
+      If <name> is already the main login, Claude just starts normally.
+
+  Ctrl+Alt+Shift+A (VS Code)
+      Shows every account with usage and opens a NEW terminal running Claude as the one you pick.
+
+  claude-acct map <name> [folder]       (folder defaults to the current one; subfolders included)
+  claude-acct unmap [folder]
+  claude-acct maps
+      Remember an account per folder, so a plain "claude-acct run" there picks it.
+
+  claude-acct sessions
+      Which accounts run in a parallel session now, and which folders are mapped.
+
+  While a parallel session runs, its account is reserved: the main login cannot switch to it,
+  auto-switch skips it and claude-acct-status only reads it. When the session ends, its newest
+  tokens go back to the saved account automatically.
+
+  Experimental: VS Code panel per folder
+  claude-acct wrapper on | off | status
+      The VS Code Claude panel cannot pick an account per folder on its own (its settings apply
+      to the whole machine). "wrapper on" sets claudeCode.claudeProcessWrapper so the panel of a
+      MAPPED folder starts as the mapped account; unmapped folders behave as before.
+      Side effects (all VS Code windows on this machine): the extension starts chats in the
+      "default" permission mode when a wrapper is set, so "wrapper on" also sets
+      claudeCode.initialPermissionMode to your Claude defaultMode; and the extension turns off its
+      own process tracking, telemetry and update check. "wrapper off" removes exactly what was added.
+      Reload VS Code windows after changing it.
+""",
+    "move": """\
+Another machine: three ways, pick one each time
+
+  1. Settings only (safest; the default)
+     claude-acct export [-o file]
+         Auto-switch on/off and limit, per-account limits, accounts kept out of auto-switch,
+         folder maps and the list of accounts. No logins.
+     claude-acct import <file>
+         Applies the settings (folder maps only for folders that exist there) and lists the
+         accounts to log in to with /login. Each machine then has its own logins.
+
+  2. With logins (backup, or a one-way copy)
+     claude-acct export --with-logins [--account <name>]... [-o file]
+         Asks for a password and writes an encrypted file (AES-256, openssl). Add --plain for an
+         unencrypted file (keep it private). For scripts: CLAUDE_ACCT_PASSWORD=... in the env.
+     claude-acct import <file> [--replace]
+         Saves the logins. An account already saved there is kept unless --replace; the account
+         in use there and accounts busy in a parallel session are never replaced.
+     Careful: if both machines keep using the same login, one of them is logged out the next
+     time the other refreshes it. For a real hand-over use move.
+
+  3. Move (a login lives in one place only)
+     claude-acct move <name> --to <ssh host> [--ssh-command 'ssh -p 2222']
+         Sends the login over SSH straight into the other machine's claude-acct (installed
+         there), and forgets it here only after the other side confirmed. Not for the account in
+         use here. For gcloud VMs, use the host name from ~/.ssh/config (gcloud compute config-ssh).
+
+  The accounts window in VS Code has buttons for 1, 2 and import.
+""",
+    "files": """\
+Files
+
+  ~/.claude/accounts/<email>.json      saved logins (tokens; never share or copy these)
+  ~/.claude/accounts/.backup/          last 5 copies of each saved login
+  ~/.claude/accounts/.claude-acct.conf auto-switch settings, disabled accounts, thresholds, time zone
+  ~/.claude/accounts/.auto-state       last check / last switch
+  ~/.claude/settings.json              hooks: autosave (Stop, SessionStart),
+                                       auto-switch (Stop, PostToolUse, UserPromptSubmit, StopFailure)
+  ~/.claude-profiles/<email>/          parallel session of that account (login + links to ~/.claude)
+  ~/.local/bin/claude-acct, claude-acct-status, claude-acct-pick, claude-acct-wrapper
+  ~/.claude/skills/switch-account, usageall
+
+  Only the claude.ai login is swapped (claudeAiOauth in ~/.claude/.credentials.json and
+  oauthAccount in ~/.claude.json). History, settings, skills and MCP logins stay shared.
+""",
+}
+
+
+def show_help(topic=None):
+    key = {"account": "accounts", "switch": "accounts", "status": "usage", "auto-switch": "auto",
+           "file": "files", "run": "parallel", "map": "parallel", "wrapper": "parallel",
+           "sessions": "parallel", "export": "move", "import": "move"}.get(topic, topic) or "overview"
+    print(HELP.get(key) or f"No help topic '{topic}'. Topics: accounts, usage, auto, parallel, files\n\n" + HELP["overview"])
+
+
+def main(argv):
+    if not argv and sys.stdin.isatty():
+        pick()
+        return
+    cmd, args = (argv[0], argv[1:]) if argv else ("list", [])
+    if cmd in ("help", "-h", "--help"):
+        show_help(args[0] if args else None)
+    elif cmd == "save":
+        print(f"Saved as {save(args[0] if args else None)}")
+    elif cmd == "use" and args:
+        use(resolve(args[0]))
+    elif cmd == "list":
+        listing("--json" in args)
+    elif cmd == "autosave":
+        autosave()
+    elif cmd == "current":
+        print(active_name() or "(not saved)")
+    elif cmd == "add-token" and args:
+        add_token(args[0])
+    elif cmd == "auto":
+        auto_cmd(args)
+    elif cmd == "hook" and args:
+        hook(args[0])
+    elif cmd in ("disable", "enable") and args:
+        set_disabled(args[0], cmd == "disable")
+    elif cmd == "run":
+        run(args)
+    elif cmd == "map":
+        map_cmd(args)
+    elif cmd == "unmap":
+        map_cmd(args, remove=True)
+    elif cmd in ("sessions", "maps"):
+        sessions_cmd() if cmd == "sessions" else map_cmd([])
+    elif cmd == "wrapper":
+        wrapper_cmd(args)
+    elif cmd == "timezone":
+        timezone_cmd(args)
+    elif cmd == "export":
+        export_cmd(args)
+    elif cmd == "import":
+        import_cmd(args)
+    elif cmd == "move":
+        move_cmd(args)
+    elif cmd == "remove" and args:
+        name = resolve(args[0])
+        if status_module().session_state(name) == "running":
+            sys.exit(f"{name} is in use in a parallel session; close it first.")
+        backup(name)  # a copy stays in .backup in case it was a mistake
+        (STORE / f"{name}.json").unlink()
+        print(f"Removed {name} (a backup is in {STORE / '.backup'})")
+    else:
+        print(f"Unknown command: {' '.join(argv)}\n", file=sys.stderr)
+        show_help()
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

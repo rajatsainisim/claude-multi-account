@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""Show usage limits (5-hour session + weekly) of every saved Claude account at once.
+
+  claude-acct-status          table of all accounts
+  claude-acct-status --json   same data as JSON
+  claude-acct-status --json --active-only   only the account the main login uses
+  claude-acct-status --fresh  read again if the last reading is older than 30 s (default 2 min)
+  claude-acct-status --cached never ask Anthropic, show the last readings only
+
+Anthropic allows about 30 usage reads per account per hour, so a reading is reused for 2 minutes,
+and after a "rate limited" answer an account is not asked again until the wait it gave is over.
+
+Reads the accounts saved by claude-acct in ~/.claude/accounts/. The active account is read
+from ~/.claude/.credentials.json and is never refreshed here (Claude Code owns it).
+An inactive account whose access token has expired is refreshed once; the new tokens are
+written back to that account's saved file only (backup first, atomic write), exactly like
+Claude Code would do after a switch. Token values are never printed.
+"""
+import concurrent.futures as cf
+import datetime as dt
+import fcntl
+import json
+import os
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+PROFILE_MARK = ".claude-acct-profile"
+PROFILES_DIR = Path(os.environ.get("CLAUDE_ACCT_PROFILES", Path.home() / ".claude-profiles"))
+CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude"))
+try:  # inside a parallel session (claude-acct run / wrapper) the marker points back to the main setup
+    _MARK = json.loads((CONFIG_DIR / PROFILE_MARK).read_text())
+except (OSError, ValueError):
+    _MARK = {}
+MAIN_DIR = Path(_MARK["main_dir"]) if _MARK else CONFIG_DIR
+# "main" = the login that plain Claude Code and the VS Code panel use; status always reports that one
+CREDS = MAIN_DIR / ".credentials.json"
+GLOBAL = Path(_MARK["main_global"]) if _MARK else (
+    (CONFIG_DIR / ".claude.json") if "CLAUDE_CONFIG_DIR" in os.environ else Path.home() / ".claude.json")
+STORE = MAIN_DIR / "accounts"
+# files and folders a parallel session shares with the main setup (everything except the login)
+SHARED = ["settings.json", "settings.local.json", "CLAUDE.md", "skills", "commands", "agents", "plugins",
+          "projects", "hooks", "output-styles", "file-history", "todos", "plans", "history.jsonl", "ide",
+          "keybindings.json", "statusline.sh", "shell-snapshots", "session-env"]
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+UA = "claude-cli (claude-acct-status)"
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def write_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def backup(name, data):
+    """Same layout as claude-acct: keep the last 5 copies per account."""
+    bdir = STORE / ".backup"
+    bdir.mkdir(mode=0o700, exist_ok=True)
+    write_atomic(bdir / f"{name}.{int(time.time())}.json", data)
+    for old in sorted(bdir.glob(f"{name}.*.json"))[:-5]:
+        old.unlink()
+
+
+# ------------------------------------------------------------ parallel sessions
+# A parallel session runs Claude Code with CLAUDE_CONFIG_DIR=~/.claude-profiles/<account>.
+# While a process uses that folder, the account's tokens live ONLY there: nothing else may refresh
+# or activate them. When no process uses it any more ("idle"), release() copies the newest tokens
+# back to the saved account and removes them from the profile.
+
+def profile_dir(name):
+    return PROFILES_DIR / name
+
+
+def profile_creds(name):
+    return profile_dir(name) / ".credentials.json"
+
+
+def profile_pids(name):
+    """PIDs whose environment points CLAUDE_CONFIG_DIR at this profile; None if it cannot be told."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    needle = b"\0CLAUDE_CONFIG_DIR=" + str(profile_dir(name)).encode() + b"\0"
+    pids = []
+    for p in proc.iterdir():
+        if not p.name.isdigit() or int(p.name) == os.getpid():
+            continue
+        try:
+            env = (p / "environ").read_bytes()
+        except OSError:
+            continue
+        if needle in b"\0" + env + (b"" if env.endswith(b"\0") else b"\0"):
+            pids.append(int(p.name))
+    return pids
+
+
+def session_state(name):
+    """'none' (no parallel session), 'running' (in use: hands off) or 'idle' (can be released)."""
+    if not profile_creds(name).exists():
+        return "none"
+    pids = profile_pids(name)
+    return "running" if pids is None or pids else "idle"
+
+
+def _store_lock():
+    STORE.mkdir(mode=0o700, exist_ok=True)
+    lock = open(STORE / ".status.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def release(name):
+    """Give an idle session's (possibly refreshed) tokens back to the saved account."""
+    with _store_lock():
+        pc = profile_creds(name)
+        oauth = load(pc).get("claudeAiOauth")
+        path = STORE / f"{name}.json"
+        prof = load(path)
+        if oauth and oauth.get("accessToken") and prof and prof.get("claudeAiOauth") != oauth:
+            backup(name, prof)
+            prof["claudeAiOauth"] = oauth
+            write_atomic(path, prof)
+        pc.unlink(missing_ok=True)
+
+
+def main_active(profs):
+    """Saved account that the main login (CREDS) uses, matched without a network call."""
+    live_tokens = load(CREDS).get("claudeAiOauth") or {}
+    live_uuid = (load(GLOBAL).get("oauthAccount") or {}).get("accountUuid")
+    for n, p in profs.items():
+        if live_tokens.get("refreshToken") and (p.get("claudeAiOauth") or {}).get("refreshToken") == live_tokens["refreshToken"]:
+            return n
+    for n, p in profs.items():
+        if live_uuid and (p.get("oauthAccount") or {}).get("accountUuid") == live_uuid:
+            return n
+    return None
+
+
+def claim(name):
+    """Prepare ~/.claude-profiles/<name> and move the account's tokens into it. Returns the folder."""
+    prof = load(STORE / f"{name}.json")
+    if not prof:
+        raise ValueError(f"no saved account '{name}'")
+    d = profile_dir(name)
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    write_atomic(d / PROFILE_MARK, {"account": name, "main_dir": str(MAIN_DIR), "main_global": str(GLOBAL)})
+    for item in SHARED:
+        src, dst = MAIN_DIR / item, d / item
+        if src.exists() and not os.path.lexists(dst):
+            dst.symlink_to(src)
+    main_g = load(GLOBAL)
+    pg_path = d / ".claude.json"
+    pg = load(pg_path) or {k: v for k, v in main_g.items() if k != "oauthAccount"}
+    pg["oauthAccount"] = prof.get("oauthAccount", {})
+    if "mcpServers" in main_g:
+        pg["mcpServers"] = main_g["mcpServers"]  # user MCP servers follow the main setup
+    projects = pg.setdefault("projects", {})
+    for path, meta in (main_g.get("projects") or {}).items():
+        projects.setdefault(path, meta)  # folder trust etc.
+    write_atomic(pg_path, pg)
+    with _store_lock():
+        if not profile_creds(name).exists():
+            write_atomic(profile_creds(name), {"claudeAiOauth": load(STORE / f"{name}.json")["claudeAiOauth"]})
+    return d
+
+
+# ------------------------------------------------------------ shared reading
+# Anthropic limits how often usage can be read per account (Claude Code reads it too), so every
+# reading is shared in STORE/.usage-cache: the VS Code extension shows it without asking again.
+# Usage numbers only, never tokens.
+USAGE_CACHE_NAME = ".usage-cache"
+
+
+READ_TTL = 120  # seconds a reading is reused before asking again (--fresh: 30)
+CACHED_ONLY = False  # --cached: never ask, only show what is known
+LIMITS = STORE / ".usage-limits"  # account -> time until which Anthropic asked us to wait
+
+
+def _cached_row(name):
+    for r in load(STORE / USAGE_CACHE_NAME).get("rows") or []:
+        if r.get("name") == name and not r.get("error") and r.get("readAt"):
+            return r
+    return None
+
+
+def _blocked_until(name):
+    return load(LIMITS).get(name, 0)
+
+
+def _block(name, seconds):
+    with _store_lock():
+        d = load(LIMITS)
+        d[name] = time.time() + seconds
+        write_atomic(LIMITS, d)
+        return d[name]
+
+
+def _rate_limited(row):
+    return bool(row.get("error")) and "rate limit" in row["error"]
+
+
+def share_reading(new_rows, full):
+    """Merge a reading into the shared cache. A rate-limited row keeps the last good numbers."""
+    try:
+        path = STORE / USAGE_CACHE_NAME
+        now = int(time.time() * 1000)
+        cache = load(path)
+        old = {r.get("name"): r for r in cache.get("rows") or [] if not r.get("error")}
+        rows = []
+        for r in new_rows:
+            if _rate_limited(r) and r["name"] in old:
+                r = dict(old[r["name"]], active=r["active"], session=r.get("session", False), stale=True)
+            rows.append(r)
+        if full:
+            cache = {"at": now, "activeAt": now, "rows": rows}
+        else:
+            if not cache.get("rows"):
+                return
+            by_name = {r["name"]: r for r in rows}
+            if any(r.get("active") for r in rows):
+                for r in cache["rows"]:
+                    r["active"] = False
+            cache["rows"] = [by_name.pop(r.get("name"), r) for r in cache["rows"]] + list(by_name.values())
+            cache["activeAt"] = now
+        write_atomic(path, cache)
+    except Exception:
+        pass  # sharing is a convenience
+
+
+def http_json(url, *, token=None, body=None, timeout=20):
+    headers = {"User-Agent": UA, "anthropic-beta": "oauth-2025-04-20"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def refresh_saved(name):
+    """Refresh an inactive account's expired token and save it back. Returns (oauth, error)."""
+    path = STORE / f"{name}.json"
+    with open(STORE / ".status.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        prof = load(path)  # re-read under the lock, the file may have changed meanwhile
+        oauth = prof.get("claudeAiOauth") or {}
+        if oauth.get("expiresAt", 0) > time.time() * 1000 + 300_000:
+            return oauth, None  # someone already refreshed it
+        if not oauth.get("refreshToken"):
+            return None, "token expired, no refresh token (log in again)"
+        if (load(CREDS).get("claudeAiOauth") or {}).get("refreshToken") == oauth["refreshToken"]:
+            return None, "now active, skipped"
+        backup(name, prof)
+        body = {"grant_type": "refresh_token", "refresh_token": oauth["refreshToken"], "client_id": CLIENT_ID}
+        if oauth.get("scopes"):
+            body["scope"] = " ".join(oauth["scopes"])
+        try:
+            new = http_json(TOKEN_URL, body=body, timeout=30)
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 401):
+                return None, "login expired/revoked (log in again, then claude-acct save)"
+            return None, f"refresh failed (HTTP {e.code})"
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            return None, f"refresh failed ({e.__class__.__name__})"
+        if not new.get("access_token"):
+            return None, "refresh failed (bad response)"
+        oauth = dict(oauth)
+        oauth["accessToken"] = new["access_token"]
+        if new.get("refresh_token"):
+            oauth["refreshToken"] = new["refresh_token"]
+        oauth["expiresAt"] = int((time.time() + int(new.get("expires_in", 3600))) * 1000)
+        if new.get("scope"):
+            oauth["scopes"] = new["scope"].split()
+        prof["claudeAiOauth"] = oauth
+        write_atomic(path, prof)
+        return oauth, None
+
+
+def limits_of(usage):
+    """[(label, percent, resets_at_iso)] in display order."""
+    rows = []
+    for lim in usage.get("limits") or []:
+        kind = lim.get("kind")
+        if kind == "session":
+            label = "5h"
+        elif kind == "weekly_all":
+            label = "week"
+        elif kind == "weekly_scoped":
+            model = (((lim.get("scope") or {}).get("model") or {}).get("display_name")) or "scoped"
+            label = f"week {model}"
+        else:
+            label = kind or "?"
+        rows.append((label, lim.get("percent"), lim.get("resets_at")))
+    if not rows:  # older response shape
+        for key, label in (("five_hour", "5h"), ("seven_day", "week"),
+                           ("seven_day_opus", "week Opus"), ("seven_day_sonnet", "week Sonnet")):
+            v = usage.get(key)
+            if v:
+                rows.append((label, v.get("utilization"), v.get("resets_at")))
+    return rows
+
+
+def check(name, prof, active):
+    email = (prof.get("oauthAccount") or {}).get("emailAddress") or name
+    plan = (prof.get("claudeAiOauth") or {}).get("subscriptionType")
+    out = {"name": name, "email": email, "plan": plan, "active": active, "limits": [], "error": None,
+           "session": False}
+    state = "none" if active else session_state(name)
+    if state == "idle":
+        release(name)
+        prof = load(STORE / f"{name}.json") or prof
+    out["session"] = state == "running"
+    # Anthropic allows only ~30 usage reads per account per hour: reuse a recent reading, and
+    # never ask while a "rate limited" answer told us to wait.
+    now = time.time()
+    cached = _cached_row(name)
+    blocked = _blocked_until(name)
+    if cached and (CACHED_ONLY or now - cached["readAt"] / 1000 < READ_TTL or now < blocked):
+        row = dict(cached, active=active, session=out["session"], email=email, plan=plan or cached.get("plan"))
+        row.pop("stale", None)
+        row.pop("blockedUntil", None)
+        if now < blocked:
+            row.update(stale=True, blockedUntil=int(blocked * 1000))
+        return row
+    if CACHED_ONLY or now < blocked:
+        out["error"] = (f"rate limited until {dt.datetime.fromtimestamp(blocked, TZ).strftime('%I:%M %p').lstrip('0')}"
+                        if now < blocked else "not read yet")
+        if now < blocked:
+            out["blockedUntil"] = int(blocked * 1000)
+        return out
+    if active:
+        oauth = load(CREDS).get("claudeAiOauth") or {}
+    elif state == "running":
+        # a parallel session owns these tokens: read only, never refresh
+        oauth = load(profile_creds(name)).get("claudeAiOauth") or {}
+    else:
+        oauth = prof.get("claudeAiOauth") or {}
+        if oauth.get("refreshToken") and oauth.get("expiresAt", 0) < time.time() * 1000 + 300_000:
+            oauth, err = refresh_saved(name)
+            if err:
+                out["error"] = err
+                return out
+    if not oauth or not oauth.get("accessToken"):
+        out["error"] = "no token saved"
+        return out
+    try:
+        usage = http_json(USAGE_URL, token=oauth["accessToken"])
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            wait = e.headers.get("Retry-After", "") if e.headers else ""
+            wait = int(wait) if wait.strip().isdigit() else 600
+            until = _block(name, max(wait, 60) + 60)
+            if cached:  # show the last numbers instead of an error
+                return dict(cached, active=active, session=out["session"], stale=True, blockedUntil=int(until * 1000))
+            out["blockedUntil"] = int(until * 1000)
+        out["error"] = {401: "token rejected (switch once or log in again)",
+                        403: "usage not available for this token",
+                        429: "rate limited by Anthropic, the next check waits"}.get(e.code, f"HTTP {e.code}")
+        return out
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        out["error"] = f"network error ({e.__class__.__name__})"
+        return out
+    out["limits"] = [{"label": l, "percent": p, "resets_at": r} for l, p, r in limits_of(usage)]
+    out["readAt"] = int(time.time() * 1000)
+    return out
+
+
+def _display_tz():
+    """Time zone for reset times: CLAUDE_ACCT_TZ, else `claude-acct timezone`, else the system's.
+
+    Cloud VMs often run on UTC; `claude-acct timezone <Area/City>` shows your own time there."""
+    name = os.environ.get("CLAUDE_ACCT_TZ") or load(STORE / ".claude-acct.conf").get("timezone")
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return dt.datetime.now().astimezone().tzinfo
+
+
+TZ = _display_tz()
+
+
+def when(iso):
+    if not iso:
+        return "-"
+    try:
+        t = dt.datetime.fromisoformat(iso).astimezone(TZ)
+    except ValueError:
+        return iso
+    now = dt.datetime.now(TZ)
+    mins = max(0, int((t - now).total_seconds() // 60))
+    left = f"{mins // 1440}d {mins % 1440 // 60}h" if mins >= 1440 else f"{mins // 60}h {mins % 60:02d}m"
+    day = "today" if t.date() == now.date() else ("tomorrow" if t.date() == now.date() + dt.timedelta(days=1) else t.strftime("%a %d %b"))
+    return f"{day} {t.strftime('%I:%M %p').lstrip('0')} (in {left})"
+
+
+def bar(p):
+    p = max(0, min(100, int(round(p or 0))))
+    n = p // 10
+    return "#" * n + "." * (10 - n) + f" {p:>3}%"
+
+
+def main():
+    as_json = "--json" in sys.argv[1:]
+    profs = {p.stem: load(p) for p in sorted(STORE.glob("*.json"))}
+    if not profs:
+        sys.exit("No saved accounts. Log in, then run: claude-acct save")
+    live_uuid = (load(GLOBAL).get("oauthAccount") or {}).get("accountUuid")
+    live_tokens = load(CREDS).get("claudeAiOauth") or {}
+
+    def is_active(prof):
+        o = prof.get("claudeAiOauth") or {}
+        if live_tokens.get("refreshToken") and o.get("refreshToken") == live_tokens.get("refreshToken"):
+            return True
+        return bool(live_uuid) and (prof.get("oauthAccount") or {}).get("accountUuid") == live_uuid
+
+    global READ_TTL, CACHED_ONLY
+    if "--fresh" in sys.argv[1:]:
+        READ_TTL = 30
+    CACHED_ONLY = "--cached" in sys.argv[1:]
+    active_only = "--active-only" in sys.argv[1:]
+    if active_only:  # one request: what changes while you work
+        profs = {n: p for n, p in profs.items() if is_active(p)}
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(lambda kv: check(kv[0], kv[1], is_active(kv[1])), profs.items()))
+    share_reading(results, full=not active_only)
+    results.sort(key=lambda r: (not r["active"], r["name"]))
+
+    if as_json:
+        print(json.dumps(results, indent=2))
+        return
+    print(f"Claude accounts status  ({dt.datetime.now(TZ).strftime('%d %b %I:%M %p')})\n")
+    for r in results:
+        mark = "* " if r["active"] else "  "
+        tag = "  <- active" if r["active"] else ("  [parallel session running]" if r.get("session") else "")
+        print(f"{mark}{r['email']}  [{r['plan'] or '?'}]{tag}")
+        if r.get("stale"):
+            until = dt.datetime.fromtimestamp(r["blockedUntil"] / 1000, TZ).strftime("%I:%M %p").lstrip("0")
+            print(f"     ! last reading shown: Anthropic asked to wait with usage checks until {until}")
+        if r["error"]:
+            print(f"     ! {r['error']}")
+        for lim in r["limits"]:
+            reset = f"resets {when(lim['resets_at'])}" if lim["resets_at"] else "not started (fresh, starts on first message)"
+            print(f"     {lim['label']:<12} {bar(lim['percent'])}   {reset}")
+        print()
+
+
+if __name__ == "__main__":
+    main()
