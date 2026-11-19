@@ -998,6 +998,11 @@ Accounts
   claude-acct            (no arguments, in a terminal)
       Plain numbered picker without usage. claude-acct-pick shows usage too.
 
+  claude-acct add-token <email>
+      Save an account from an access token (and optionally a refresh token), typed into a hidden
+      prompt or piped on stdin, never on the command line. For machines without a browser; a
+      normal /login is better.
+
   Adding an account: run /login in Claude Code with the new account. Do NOT run /logout or
   press Sign out first, that can invalidate the saved token of the current account.
   If a saved login stops working: /login with that account, then claude-acct save <name>.

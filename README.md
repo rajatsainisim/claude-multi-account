@@ -85,6 +85,8 @@ The installer adds a small extension (plain JavaScript, not from the Marketplace
 yellow from 80%, red from 95%; the sync icon means auto-switch is on. Hover for every account
 with usage bars and reset times; click an account's name there to switch to it.
 
+![The accounts window, with example accounts](docs/accounts-window.png)
+
 **Accounts window** (click the status bar or press Ctrl+Alt+A). It opens over the editor in its
 own dark theme and closes with Esc, its close button, a click outside it, or a click anywhere else
 in VS Code. Everything can be changed here:
@@ -100,7 +102,33 @@ in VS Code. Everything can be changed here:
 - **Add an account** and **All commands**.
 - Keyboard: ↑/↓ to move, Enter to use the account, Esc to close.
 
-The command palette has the same actions under "Claude Accounts: …", including a quick menu.
+**Keyboard shortcuts**
+
+| Keys | What |
+|---|---|
+| Ctrl+Alt+A | open the accounts window |
+| Ctrl+Alt+Shift+A | pick an account and run Claude as it in a new terminal |
+| in the window: ↑ / ↓, Enter, Esc | move between accounts, use the selected one, close |
+
+**Command palette** (Ctrl+Shift+P, type "Claude Accounts")
+
+| Command | What |
+|---|---|
+| Claude Accounts: Open | the accounts window |
+| Claude Accounts: Quick menu | the same actions as a list |
+| Claude Accounts: Run Claude in a new terminal as account | like Ctrl+Alt+Shift+A |
+| Claude Accounts: Turn auto-switch on/off | toggle auto-switch |
+| Claude Accounts: Set auto-switch limit | 80–100%, or any value from 50 |
+| Claude Accounts: Per-account settings | own limit, keep out of auto-switch, switch, terminal, forget |
+| Claude Accounts: Map this folder to an account | the account `claude-acct run` uses here |
+| Claude Accounts: Panel follows folder maps (experimental) on/off | the panel wrapper |
+| Claude Accounts: Refresh usage | read usage now |
+| Claude Accounts: Export settings (no logins) | export, settings only |
+| Claude Accounts: Export logins (encrypted) | export with logins, password-protected |
+| Claude Accounts: Import | import an export file |
+| Claude Accounts: Help | every `claude-acct` command in the output panel |
+
+Setting: `claudeAccounts.backgroundRefreshMinutes` (default 0, off), see below.
 
 ## Auto-switch
 
@@ -207,7 +235,10 @@ Reading usage never uses your Claude usage itself.
 (`accounts`, `usage`, `auto`, `parallel`, `move`, `files`).
 
 ```
-claude-acct list | use <name> | save [name] | remove <name> | current
+claude-acct help [accounts | usage | auto | parallel | move | files]   # also -h, --help
+claude-acct                                    # plain numbered picker (in a terminal)
+claude-acct list [--json] | use <name> | save [name] | remove <name> | current
+claude-acct add-token <email>                  # add an account from a token, no browser (see below)
 claude-acct-status [--json] [--fresh | --cached] [--active-only]
 claude-acct timezone [<Area/City> | --unset]
 claude-acct-pick [--run]
@@ -220,6 +251,26 @@ claude-acct export [--with-logins [--plain]] [--account <name>]... [-o file]
 claude-acct import <file|-> [--replace] [--no-settings]
 claude-acct move <name> --to <ssh host> [--ssh-command '<ssh ...>']
 ```
+
+| Command | What it does |
+|---|---|
+| `claude-acct help [topic]` | every command, or one area in detail |
+| `claude-acct` | a plain numbered list to switch (no usage; `claude-acct-pick` shows usage) |
+| `claude-acct list [--json]` | saved accounts with their plan; `*` is the account in use |
+| `claude-acct use <name>` | switch the main login; the chat continues on it |
+| `claude-acct save [name]` | save the login in use now (normally automatic after a reply) |
+| `claude-acct remove <name>` | forget a saved account here (a backup is kept; nothing is logged out) |
+| `claude-acct current` | print the account in use |
+| `claude-acct add-token <email>` | save an account from an access token (and refresh token), read from a hidden prompt or stdin, never from the command line. For headless machines; a normal `/login` is better |
+| `claude-acct-status [--json] [--fresh \| --cached] [--active-only]` | usage of every account; `--fresh` reads again after 30 s, `--cached` never asks, `--active-only` only the account in use |
+| `claude-acct-pick [--run]` | usage list, then type a number to switch (`--run`: run Claude as it here) |
+| `claude-acct timezone [<Area/City> \| --unset]` | time zone for reset times (VMs often run on UTC) |
+| `claude-acct auto …` / `disable` / `enable` | auto-switch, see [Auto-switch](#auto-switch) |
+| `claude-acct run` / `map` / `unmap` / `maps` / `sessions` / `wrapper` | see [Accounts side by side](#accounts-side-by-side) |
+| `claude-acct export` / `import` / `move` | see [Another machine](#another-machine-export-import-move) |
+| `claude-acct autosave`, `claude-acct hook stop\|tool\|prompt\|stop-failure` | used by the Claude Code hooks; you do not run them |
+
+In the chat: `/switch-account` (pick and switch) and `/usageall` (usage table).
 
 ## Files
 
